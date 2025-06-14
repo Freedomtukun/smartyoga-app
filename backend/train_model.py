@@ -32,7 +32,12 @@ from functools import partial
 
 import numpy as np
 import pandas as pd
+# Pillow ≥ 9.1 用 Image.Resampling；低版本回退到 Image.LANCZOS
 from PIL import Image
+try:
+    _RESAMPLE = Image.Resampling.LANCZOS        # Pillow ≥ 9.1
+except AttributeError:                          # Pillow < 9.1
+    _RESAMPLE = Image.LANCZOS
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import matplotlib
@@ -85,7 +90,10 @@ def parse_arguments():
     return parser.parse_args()
 
 
-def load_and_preprocess_image(image_path: Path, target_size: Tuple[int, int] = (224, 224)) -> Optional[np.ndarray]:
+def load_and_preprocess_image(
+    image_path: Path,
+    target_size: Tuple[int, int] = (224, 224),
+) -> Optional[np.ndarray]:
     """
     Load and preprocess a single image.
     
@@ -97,8 +105,8 @@ def load_and_preprocess_image(image_path: Path, target_size: Tuple[int, int] = (
         Preprocessed image array normalized to [0, 1], or None if loading fails
     """
     try:
-        img = Image.open(image_path).convert('RGB')
-        img = img.resize(target_size, Image.Resampling.LANCZOS)
+        img = Image.open(image_path).convert("RGB")
+        img = img.resize(target_size, _RESAMPLE)
         img_array = np.array(img, dtype=np.float32) / 255.0
         return img_array
     except Exception as e:
@@ -138,15 +146,21 @@ def load_training_data(workers: int = 4) -> Tuple[np.ndarray, np.ndarray, np.nda
     logger.info("=" * 60)
     logger.info("Starting data loading process...")
 
-    # CSV bookkeeping (generate if missing)
+    # 确保 CSV 存在；若缺失则自动生成
     csv_path = "data_lists/all_images.csv"
     if not os.path.exists(csv_path):
-        logger.info(f"CSV not found at {csv_path}, generating via generate_image_list.py")
+        logger.info("CSV 不存在，调用 generate_image_list.py 重新生成…")
         subprocess.run([sys.executable, "generate_image_list.py"], check=True)
 
+    # 映射：文件名 → 分数；若无分数列则默认 1.0
+    score_map = {}
     if os.path.exists(csv_path):
         df = pd.read_csv(csv_path)
-        logger.info(f"Loaded CSV with {len(df)} entries")
+        if "score" in df.columns:
+            score_map = {row["file"]: float(row["score"]) for _, row in df.iterrows()}
+        logger.info(
+            f"Loaded CSV ({len(df)} rows) — score column: {'yes' if score_map else 'no'}"
+        )
 
     dataset_path = Path(DATASET_DIR)
     image_paths: List[Path] = []
@@ -160,25 +174,32 @@ def load_training_data(workers: int = 4) -> Tuple[np.ndarray, np.ndarray, np.nda
     logger.info(f"Found {len(image_paths)} images in {DATASET_DIR}")
     logger.info(f"Loading images using {workers} workers...")
 
-    images = []
+    images, scores, binary_labels = [], [], []
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        future_to_path = {executor.submit(load_and_preprocess_image, p): p for p in image_paths}
+        future_to_path = {
+            executor.submit(load_and_preprocess_image, p): p for p in image_paths
+        }
         loaded_count = 0
         for future in as_completed(future_to_path):
             img_array = future.result()
+            img_path = future_to_path[future]
             if img_array is not None:
                 images.append(img_array)
+                # 真实分数或默认 1.0
+                scores.append(score_map.get(img_path.name, 1.0))
+                binary_labels.append(1.0)  # 目前只有正样本
                 loaded_count += 1
                 if loaded_count % 100 == 0:
-                    logger.info(f"Loaded {loaded_count}/{len(image_paths)} images...")
+                    logger.info(
+                        f"Loaded {loaded_count}/{len(image_paths)} images..."
+                    )
 
     if not images:
         raise ValueError("No images were successfully loaded!")
 
-    scores = np.full(len(images), 1.0, dtype=np.float32)
-    binary_labels = np.ones(len(images), dtype=np.float32)
-
-    images = np.array(images)
+    images = np.array(images, dtype=np.float32)
+    scores = np.array(scores, dtype=np.float32)
+    binary_labels = np.array(binary_labels, dtype=np.float32)
 
     logger.info(f"Successfully loaded {len(images)} images")
     logger.info(f"Images shape: {images.shape}")
@@ -370,9 +391,15 @@ def train_model(images: np.ndarray, scores: np.ndarray, binary_labels: np.ndarra
     logger.info("=" * 60)
     logger.info("Starting model training...")
     
-    # Split data
+    # 若只有 1 个类别则不能 stratify
+    stratifier = binary_labels if len(np.unique(binary_labels)) >= 2 else None
     X_train, X_val, y_score_train, y_score_val, y_class_train, y_class_val = train_test_split(
-        images, scores, binary_labels, test_size=validation_split, random_state=42, stratify=binary_labels
+        images,
+        scores,
+        binary_labels,
+        test_size=validation_split,
+        random_state=42,
+        stratify=stratifier,
     )
     
     logger.info(f"Training set: {len(X_train)} samples")
@@ -380,13 +407,18 @@ def train_model(images: np.ndarray, scores: np.ndarray, binary_labels: np.ndarra
     
     # Create model
     input_shape = (224, 224, 3)
-    model = create_cnn_model(input_shape, learning_rate=learning_rate, use_multi_head=use_multi_head)
+    effective_multi_head = use_multi_head and len(np.unique(binary_labels)) >= 2
+    model = create_cnn_model(
+        input_shape,
+        learning_rate=learning_rate,
+        use_multi_head=effective_multi_head,
+    )
     
     logger.info("Model architecture:")
     model.summary(print_fn=logger.info)
     
     # Prepare data for training
-    if use_multi_head:
+    if effective_multi_head:
         y_train = {'score': y_score_train, 'classification': y_class_train}
         y_val = {'score': y_score_val, 'classification': y_class_val}
     else:
@@ -397,7 +429,7 @@ def train_model(images: np.ndarray, scores: np.ndarray, binary_labels: np.ndarra
     logger.info(f"- Batch size: {batch_size}")
     logger.info(f"- Epochs: {epochs}")
     logger.info(f"- Learning rate: {learning_rate}")
-    logger.info(f"- Multi-head: {use_multi_head}")
+    logger.info(f"- Multi-head: {effective_multi_head}")
     
     # Train model
     history = model.fit(
@@ -410,7 +442,7 @@ def train_model(images: np.ndarray, scores: np.ndarray, binary_labels: np.ndarra
     
     # Print final metrics
     logger.info("Training completed!")
-    if use_multi_head:
+    if effective_multi_head:
         logger.info(f"Final training score MAE: {history.history['score_mae'][-1]:.4f}")
         logger.info(f"Final validation score MAE: {history.history['val_score_mae'][-1]:.4f}")
         logger.info(f"Final training classification accuracy: {history.history['classification_accuracy'][-1]:.4f}")
